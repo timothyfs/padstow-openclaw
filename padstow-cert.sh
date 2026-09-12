@@ -2,10 +2,11 @@
 #
 # padstow-cert.sh — Padstow-OpenClaw distribution certification gate.
 #
-# A distribution tag (padstow-<upstreamver>-alpha.N) is ONLY cut after this
-# script exits 0. It proves the pinned upstream commit builds and actually
-# brings the gateway up against a local model in a container — the same
-# liveness the installer re-runs on the target machine.
+# The published Alpha distribution is a squashed root commit: upstream OpenClaw
+# v2026.9.3 plus Padstow's two distribution files. This script proves that root
+# tag resolves to the expected pin, the working tree remains verbatim against
+# upstream, builds, and can bring the gateway up against a local model in a
+# container.
 #
 # HONESTY RULE (matches the installer): every step reports REAL pass/fail.
 # The one step that needs an external artefact — a local model pulled into the
@@ -26,10 +27,11 @@
 set -euo pipefail
 
 # --- Pinned upstream source-of-truth ---------------------------------------
-# The AUTHORITATIVE pin is the COMMIT SHA (the annotated tag object wraps it;
-# the npm build metadata short-SHA matches this commit, not the tag object).
+# The installer pins the published distribution root. The upstream commit and
+# tree are provenance anchors used to prove the root is still verbatim.
 readonly UPSTREAM_TAG="v2026.9.3"
-readonly PINNED_COMMIT="1391f7cd2d40ab5bbcf2f5f831d3a64f520e72d7"
+readonly UPSTREAM_COMMIT="1391f7cd2d40ab5bbcf2f5f831d3a64f520e72d7"
+readonly DISTRIBUTION_ROOT="2a5c305c2ee95e983ad4712998f3a4ea88408619"
 readonly PADSTOW_TAG="padstow-2026.9.3-alpha.1"
 readonly NODE_ENGINE_HINT=">=24.16.0 <25 || >=26.1.0"
 
@@ -44,13 +46,18 @@ MODEL_ROUNDTRIP="pending"   # pass | skip (never silently pass)
 
 fail() { c_fail "$1"; FAILED=1; }
 
-# --- 1. Pin verification: are we on the exact certified commit? -------------
+# --- 1. Pin verification: does the tag resolve to the distribution root? ----
 c_step "1. Pin verification"
-HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || echo 'no-git')"
-if [[ "$HEAD_SHA" == "$PINNED_COMMIT" ]]; then
-  c_pass "HEAD is the pinned commit ($PINNED_COMMIT)"
+TAG_SHA="$(git rev-parse "${PADSTOW_TAG}^{commit}" 2>/dev/null || true)"
+if [[ -z "$TAG_SHA" ]]; then
+  git fetch --tags origin "$PADSTOW_TAG" >/tmp/padstow-cert-tag-fetch.log 2>&1 || true
+  TAG_SHA="$(git rev-parse "${PADSTOW_TAG}^{commit}" 2>/dev/null || true)"
+fi
+
+if [[ "$TAG_SHA" == "$DISTRIBUTION_ROOT" ]]; then
+  c_pass "${PADSTOW_TAG} resolves to the published distribution root ($DISTRIBUTION_ROOT)"
 else
-  fail "HEAD ($HEAD_SHA) is not the pinned commit ($PINNED_COMMIT). Check out ${UPSTREAM_TAG} before certifying."
+  fail "${PADSTOW_TAG} resolved to '${TAG_SHA:-missing}', not the published distribution root ($DISTRIBUTION_ROOT)."
 fi
 
 # --- 2. Runtime version gate -----------------------------------------------
@@ -71,26 +78,46 @@ fi
 # The distribution policy is VERBATIM. Only cert/doc artefacts we add are
 # allowed to differ. Any other tracked change means the fork is no longer a
 # clean pinned mirror and must not be certified as verbatim.
-c_step "3. Verbatim policy (no source delta vs pinned commit)"
+c_step "3. Verbatim policy (no source delta vs upstream)"
 ALLOWED='padstow-cert.sh|DISTRIBUTION.md'
-DELTA="$(git diff --name-only "$PINNED_COMMIT" -- 2>/dev/null | grep -Ev "^($ALLOWED)$" || true)"
-if [[ -z "$DELTA" ]]; then
-  c_pass "No source delta from upstream (verbatim)"
+UPSTREAM_REF=""
+DELTA=""
+if git rev-parse --verify "${UPSTREAM_COMMIT}^{commit}" >/dev/null 2>&1; then
+  UPSTREAM_REF="$UPSTREAM_COMMIT"
+elif git fetch --depth 1 https://github.com/openclaw/openclaw.git "$UPSTREAM_TAG" >/tmp/padstow-cert-fetch.log 2>&1; then
+  UPSTREAM_REF="FETCH_HEAD"
+else
+  fail "Could not fetch upstream ${UPSTREAM_TAG} for verbatim comparison — see /tmp/padstow-cert-fetch.log"
+fi
+
+if [[ -n "$UPSTREAM_REF" ]]; then
+  DELTA="$(git diff --name-only "$UPSTREAM_REF" HEAD -- 2>/dev/null | grep -Ev "^($ALLOWED)$" || true)"
+fi
+
+if [[ -n "$UPSTREAM_REF" && -z "$DELTA" ]]; then
+  c_pass "No source delta from upstream ${UPSTREAM_TAG} (verbatim)"
 else
   fail "Unexpected delta from upstream (not verbatim):"$'\n'"$DELTA"
 fi
 
 # --- 4. Build from the pinned source ---------------------------------------
 c_step "4. Build"
+PNPM_CMD=()
 if command -v pnpm >/dev/null 2>&1; then
-  if pnpm install --frozen-lockfile >/tmp/padstow-cert-install.log 2>&1 \
-     && pnpm build >/tmp/padstow-cert-build.log 2>&1; then
+  PNPM_CMD=(pnpm)
+elif command -v corepack >/dev/null 2>&1; then
+  PNPM_CMD=(corepack pnpm)
+fi
+
+if [[ "${#PNPM_CMD[@]}" -gt 0 ]]; then
+  if "${PNPM_CMD[@]}" install --frozen-lockfile >/tmp/padstow-cert-install.log 2>&1 \
+     && "${PNPM_CMD[@]}" build >/tmp/padstow-cert-build.log 2>&1; then
     c_pass "pnpm install --frozen-lockfile && pnpm build"
   else
     fail "Build failed — see /tmp/padstow-cert-install.log and /tmp/padstow-cert-build.log"
   fi
 else
-  fail "pnpm not found (packageManager is pnpm; do not substitute npm)"
+  fail "pnpm/corepack not found (packageManager is pnpm; do not substitute npm)"
 fi
 
 # --- 5. Container build (the deploy target) --------------------------------
@@ -161,13 +188,17 @@ fi
 
 if [[ "$MODEL_ROUNDTRIP" == "pass" ]]; then
   c_pass "Build + container + real gateway liveness all green."
-  printf '\n\033[32mCERTIFIED.\033[0m Recommend cutting the signed tag:\n'
+  printf '\n\033[32mCERTIFIED.\033[0m Recommend cutting or preserving the signed/annotated tag:\n'
   printf '    git tag -s %s %s -m "Padstow-OpenClaw %s (verbatim, certified)"\n' \
-    "$PADSTOW_TAG" "$PINNED_COMMIT" "$PADSTOW_TAG"
+    "$PADSTOW_TAG" "$DISTRIBUTION_ROOT" "$PADSTOW_TAG"
   printf '    git push origin %s\n' "$PADSTOW_TAG"
   exit 0
 else
-  c_skip "Build + container green, but gateway liveness was SKIPPED (no local model)."
+  if [[ "${PADSTOW_CERT_SKIP_DOCKER:-0}" == "1" ]]; then
+    c_skip "Build green, but container build and gateway liveness were SKIPPED (dev mode)."
+  else
+    c_skip "Build + container green, but gateway liveness was SKIPPED (no local model)."
+  fi
   printf '\n\033[33mBUILD-CERTIFIED, LIVENESS UNPROVEN.\033[0m\n'
   printf 'The build gate passed, but a tag must NOT be cut until a real gateway\n'
   printf 'liveness passes. Re-run with PADSTOW_CERT_MODEL=<model> on a machine with\n'
