@@ -1,0 +1,90 @@
+name: Publish Padstow-OpenClaw image (GHCR)
+
+# Builds the hardened Padstow-OpenClaw runtime image from THIS branch's
+# certified distribution tree and publishes it to GHCR by tag + digest.
+#
+# This branch (`ci`) exists only to carry this workflow. The build context is
+# the verbatim distribution tree checked out at the pinned certification tag —
+# `main` and the release tag stay byte-identical to upstream. The installer then
+# pulls the published image by digest instead of building locally.
+#
+# Uses the repo's built-in GITHUB_TOKEN (packages: write) — no PAT needed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to publish (e.g. alpha.1)"
+        required: true
+        default: "alpha.1"
+      source_ref:
+        description: "Git ref of the certified distribution tree to build"
+        required: true
+        default: "padstow-2026.9.3-alpha.1"
+
+concurrency:
+  group: padstow-ghcr-publish-${{ github.event.inputs.image_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/padstow-openclaw
+    steps:
+      - name: Check out the certified distribution tree
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.source_ref }}
+          fetch-depth: 1
+
+      - name: Verify build context has the distribution Dockerfile
+        run: |
+          test -f Dockerfile || { echo "::error::no Dockerfile in ${{ github.event.inputs.source_ref }}"; exit 1; }
+          echo "Building from $(git rev-parse HEAD)"
+
+      - name: Set up QEMU (arm64 emulation on x86 runner)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (linux/arm64) by tag + digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ github.event.inputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report published digest
+        run: |
+          echo "Published: ${{ env.IMAGE }}:${{ github.event.inputs.image_tag }}"
+          echo "Digest:    ${{ steps.build.outputs.digest }}"
+          {
+            echo "## Padstow-OpenClaw image published"
+            echo ""
+            echo "- **Image:** \`${{ env.IMAGE }}:${{ github.event.inputs.image_tag }}\`"
+            echo "- **Digest:** \`${{ steps.build.outputs.digest }}\`"
+            echo "- **Source ref:** \`${{ github.event.inputs.source_ref }}\`"
+            echo ""
+            echo "Pin the installer to: \`${{ env.IMAGE }}@${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
